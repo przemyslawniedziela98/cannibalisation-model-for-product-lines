@@ -1,9 +1,8 @@
 ---
 title: "Cannibalisation in the software product lines <br> RDD used for Windows OS"
 output:
-  html_document:
-    df_print: paged
-  pdf_document: default
+  github_document:
+    html_preview: false
 warnings: no
 ---
 <b>Author:</b> Przemyslaw Niedziela (przemyslaw.niedziela98@gmail.com) <br> 
