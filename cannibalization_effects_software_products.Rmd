@@ -1,0 +1,426 @@
+---
+title: "Cannibalisation in the software product lines <br> RDD used for Windows OS"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+warnings: no
+---
+<b>Author:</b> Przemyslaw Niedziela (przemyslaw.niedziela98@gmail.com) <br> 
+<b>Date:</b> May 2024 <br>
+<br> <br> 
+<b> TL;DR </b> <br>
+This analysis aims to estimate the cannibalization effect following the launch of Windows 10 on Windows 8.1 and Windows 7, utilizing a quasi-RDD approach. This method seeks to estimate discontinuity and kinks among specific Windows OS. The data is limited to Europe, with the unit of analysis being households. <br>  
+Data is sourced from two main providers: <br> <br> 
+(1) Eurostat - two datasets: <br>
+  -  [Households - availability of computers](https://ec.europa.eu/eurostat/web/products-datasets/-/isoc_ci_cm_h) <br> 
+  -  [Number of households by household composition](https://data.europa.eu/data/datasets/jfpeap7gs0z4sxsrztrkig) <br> 
+(2) StatCounter - two datasets: <br>
+- [Desktop Windows Version Market Share Europe](https://gs.statcounter.com/os-version-market-share/windows/desktop/europe#monthly-200902-202405) <br> 
+- [Operating System Market Share Europe](https://gs.statcounter.com/os-market-share/all/europe/#monthly-200902-202405)
+```{r setup, include=FALSE} 
+knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
+```
+
+```{r}
+
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(strucchange)
+library(zoo)
+library(lmtest)
+library(car)
+library(pheatmap)
+library(orcutt)
+```
+
+### Reading dataset 
+```{r}
+eurostat_nr_computers_raw <- read.csv("eurostat_computer_numbers.csv")
+eurostat_households_raw <- read.csv("eurostat_size_of_houses.csv")
+
+os_combined <- read.csv("os_combined-eu-monthly-200902-202405.csv")
+windows_combined <- read.csv("windows_version-eu-monthly-200902-202405.csv")
+```
+
+### Processing dataset
+Data from Eurostat <br> 
+Processing  %of households with the computer in UE
+```{r}
+nr_eu_computers <- subset(eurostat_nr_computers_raw, 
+                          freq.indic_is.unit.hhtyp.geo.TIME_PERIOD == 'A,H_COMP,PC_HH,TOTAL,EU27_2007')
+
+nr_eu_computers_year <- list()
+for (col in names(nr_eu_computers)[-1]) {
+  nr_eu_computers_year[[sub("X", "", col)]] <- as.numeric(nr_eu_computers[1, col])
+}
+
+nr_eu_computers <- data.frame(
+  TIME_PERIOD = as.numeric(names(nr_eu_computers_year)), 
+  OBS_VALUE_COMP = unlist(nr_eu_computers_year)           
+)
+
+```
+Filling %of computers missing data 
+```{r}
+#missing data for 2014 and 2016 - filling with mean to keep the trend 
+get_mean_by_year <- function(df, year_previous, year_next) {
+  mean_value <- df %>%
+    filter(TIME_PERIOD %in% c(year_previous, year_next)) %>%  
+    summarise(mean_value = mean(OBS_VALUE_COMP, na.rm = TRUE))
+  
+  return(mean_value$mean_value)
+}
+
+nr_eu_computers <- bind_rows(nr_eu_computers, 
+                          data.frame(TIME_PERIOD = 2014, OBS_VALUE_COMP = get_mean_by_year(nr_eu_computers, 2013, 2015)))
+nr_eu_computers <- bind_rows(nr_eu_computers, 
+                          data.frame(TIME_PERIOD = 2016, OBS_VALUE_COMP = get_mean_by_year(nr_eu_computers, 2015, 2017)))
+
+```
+Number of households with the computer in EU 
+```{r}
+#get nr of households in UE per year 
+eurostat_households <- eurostat_households_raw %>%
+  filter(agechild == 'TOTAL', 
+         n_child == 'TOTAL', 
+         hhcomp == 'TOTAL', 
+         geo == 'EU27_2020') %>%
+  select(TIME_PERIOD, OBS_VALUE)
+
+eurostat_households_with_comp <- inner_join(eurostat_households, nr_eu_computers, by = "TIME_PERIOD")
+
+eurostat_households_with_comp <- eurostat_households_with_comp %>%
+  mutate(nr_of_households_with_comp = OBS_VALUE * OBS_VALUE_COMP * 10) # Multiplied by 10 because OBS_VALUE*1000 and OBS_VALUE_COMP in %
+
+```
+
+Data from StatCounter 
+```{r}
+get_year <- function(df) {
+  df %>%
+    mutate(Date = as.Date(paste0(Date, "-01"))) %>%
+    mutate(year = as.integer(format(Date, "%Y")))
+}
+
+os_combined <- get_year(os_combined)
+windows_combined <- get_year(windows_combined)
+
+windows_combined <- windows_combined %>%
+  filter(year <= 2017, year >= 2014)
+
+os_real_volume_raw <- inner_join(os_combined, eurostat_households_with_comp, by = c("year" = "TIME_PERIOD"))
+
+os_real_volume_raw <- os_real_volume_raw %>%
+  mutate(households_with_windows = Windows * nr_of_households_with_comp / 100)
+
+windows_real_volume <- os_real_volume_raw %>%
+  select(Date, households_with_windows)
+
+windows_df <- inner_join(windows_combined, windows_real_volume, by = "Date")
+```
+
+Number of households with specific Windows OS version 
+```{r}
+columns_to_multiply <- c("Win7", "WinXP", "Win10", "WinVista", "Win8.1", "Win8", "Win2000")
+windows_df <- windows_df %>%
+  mutate(across(all_of(columns_to_multiply), ~ . * households_with_windows))
+```
+
+```{r echo=T, results='hide'} 
+summary(windows_df)
+```
+```{r echo=T, results='hide'} 
+head(windows_df)
+```
+
+### Data visualisation
+```{r}
+df_melted <- windows_df %>%
+  select(Date, all_of(columns_to_multiply)) %>%
+  pivot_longer(cols = -Date, names_to = "Windows_Version", values_to = "Value")
+
+line_plot <- ggplot(df_melted, aes(x = Date, 
+                                   y = Value, 
+                                   color = Windows_Version, 
+                                   group = Windows_Version)) +
+  geom_line() +
+  labs(title = "Estimated Number of Households Using Specific Windows OS Version",
+       x = "Date",
+       y = "Number of Households",
+       color = "Windows Version") +
+  theme_minimal()
+
+ggsave("nr_of_households.png", line_plot, width = 10, height = 4, units = "in")
+
+print(line_plot)
+```
+
+```{r}
+df_melted <- windows_combined %>%
+  select(Date, all_of(columns_to_multiply)) %>%
+  pivot_longer(cols = -Date, names_to = "Windows_Version", values_to = "Value")
+
+bar_plot <- ggplot(df_melted, aes(x = Date, y = Value, fill = Windows_Version)) +
+  geom_col(position = "stack", width = 22) +
+  labs(title = "Estimated Share of Windows OS Versions in Europe",
+       x = "Date",
+       y = "Percentage Share",
+       fill = "Windows Version") +
+  theme_minimal() +
+  scale_fill_viridis_d(option = "C", begin = 0.1, end = 0.9) +  
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        legend.position = "right")
+
+print(bar_plot)
+```
+
+### Checking structural breakpoints
+Chow test for structural breakpoint after the Launch of Windows 10 
+```{r}
+WINDOW_10_LAUNCH <- '2015-07-01'
+
+windows_df <- windows_df %>%
+  mutate(x = row_number())
+
+point <- windows_df %>%
+  filter(Date == WINDOW_10_LAUNCH)
+
+test_statistic <- vector("numeric", length(columns_to_multiply))
+p_value <- vector("numeric", length(columns_to_multiply))
+
+
+for (i in seq_along(columns_to_multiply)) {
+  col <- columns_to_multiply[i]
+  test <- sctest(windows_df[[col]] ~ windows_df$x, type = "Chow", point = point$x)
+  test_statistic[i] <- test$stat
+  p_value[i] <- test$p.value
+}
+
+chow_test_structural_point <- data.frame(
+  Column = columns_to_multiply,
+  F_Statistic = test_statistic,
+  P_Value = p_value, 
+  weighted_test_static = test_statistic * unlist(point[columns_to_multiply][1, ])
+)
+
+chow_test_structural_point <- chow_test_structural_point %>%
+  filter(Column != 'Win10') %>%
+  arrange(desc(weighted_test_static))
+
+print(chow_test_structural_point)
+```
+### Checking correlations 
+```{r}
+products_df_before <- windows_df %>% 
+  filter((x >= point$x - 11) & (x < point$x + 1)) %>% 
+  select(all_of(columns_to_multiply))
+
+products_df_before <- products_df_before[, !names(products_df_before) %in% "Win10"]
+
+products_df_after <- windows_df %>% 
+  filter((x > point$x + 1) & (x < point$x + 13)) %>% 
+  select(all_of(columns_to_multiply))
+
+data_list <- list(before = products_df_before, after = products_df_after)
+
+for (name in names(data_list)) {
+  product_df <- data_list[[name]]
+  correlation_matrix <- cor(product_df)
+  
+  pheatmap(correlation_matrix, 
+           display_numbers = TRUE, 
+           color = colorRampPalette(c('white', 'red'))(100), 
+           cluster_rows = FALSE, 
+           cluster_cols = FALSE, 
+           fontsize_number = 15,
+           main = sprintf("Heatmap of Correlation Matrix %s Launch of Windows 10", name))
+}
+```
+
+
+```{r}
+for (col in columns_to_multiply){
+  df_hist <- windows_df %>% 
+    filter((x >= point$x - 11) & (x < point$x + 12)) 
+    
+  hist(df_hist[[col]], main = sprintf("Histogram of %s", col), xlab = col)
+}
+```
+
+### Modeling effect using regression with discontinuity 
+```{r}
+evaluate_model <- function(model) {
+  print(summary(model))
+  print(vif(model))
+  print(bptest(model))
+  print(dwtest(model))
+  plot(model, which = 1)
+}
+
+show_predictions <- function(df, point_break, model) {
+  df$fit <- predict(model)
+  
+  beta_2 <- coef(model)["D"]
+  beta_3 <- coef(model)["K"]
+  
+  print(sprintf("beta2: %s", beta_2))
+  print(sprintf("beta3: %s", beta_3))
+  
+  df$predicted_effect <- ifelse(df$x >= point_break, beta_2 + beta_3 * (df$x - point_break), NA)
+  df$x_visual <- df$x - df$x[1] - 11.5
+  
+  graph <- ggplot(df, aes(x = x_visual, y = y)) +
+    geom_point() +
+    geom_line(aes(y = ifelse(df$x >= point_break, df$fit, NA)), color = 'gray', size = 1) +
+    geom_line(aes(y = ifelse(df$x < point_break, df$fit, NA)), color = 'gray', size = 1) +
+    geom_line(aes(y = ifelse(df$x >= point_break, df$fit - df$predicted_effect, NA)), color = 'gray', linetype = "dashed", size = 1) +
+    geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+    ggtitle(sprintf("Users of %s with RDD", col)) +
+    xlab("Months after Win10 launch") +
+    ylab(sprintf("Users %s", col)) + 
+    theme_minimal()
+  
+  plot(graph)
+  return(df)
+}
+```
+
+Windows7 <> Windows10 
+```{r}
+result_list <- list()
+
+col <- "Win7"
+point_break <- point$x + 1
+
+df <- data.frame(
+  x = windows_df$x, 
+  y = windows_df[[col]], 
+  t = windows_df$households_with_windows,
+  wv = windows_df$WinVista,
+  wx = windows_df$WinXP,
+  w2k = windows_df$Win2000,
+  w7 = windows_df$Win7
+)
+
+df <- df[(point_break - 12):(point_break + 12),]
+
+df$D <- ifelse(df$x >= point_break, 1, 0)
+df$K <- ifelse(df$x >= point_break, df$x - point_break, 0)
+df$rest <- df$wv + df$wx + df$w2k
+
+model <- lm(y ~ D + K + t + rest, data = df)
+evaluate_model(model)
+
+#Cochrane-Orcutt transformation
+co_model <- cochrane.orcutt(model)
+summary(co_model)
+
+df <- show_predictions(df, point_break, co_model)
+
+predictions_w7 <- df$predicted_effect
+df$model <- col
+result_list[[col]] <- df
+```
+Windows8.1 <> Windows10 
+```{r}
+col <- "Win8.1"
+predictions_w7[is.na(predictions_w7)] <- 0
+
+point_break <- point$x + 1
+
+df <- data.frame(
+  x = windows_df$x, 
+  y = windows_df[[col]], 
+  t = windows_df$households_with_windows,
+  wv = windows_df$WinVista,
+  wx = windows_df$WinXP,
+  w2k = windows_df$Win2000,
+  w7 = windows_df$Win7,
+  w8 = windows_df$Win8
+)
+
+df <- df[(point_break - 12):(point_break + 12),]
+
+df$D <- ifelse(df$x >= point_break, 1, 0)
+df$K <- ifelse(df$x >= point_break, df$x - point_break, 0) 
+df$rest <- df$wx + df$wv + df$w2k + df$w7 - predictions_w7 + df$w8
+
+model <- lm(y ~ D + K + t + rest, data = df)
+evaluate_model(model)
+
+#Cochrane-Orcutt transformation
+co_model <- cochrane.orcutt(model)
+summary(co_model)
+
+df <- show_predictions(df, point_break, co_model)
+df$model <- col
+
+result_list[[col]] <- df
+```
+
+
+Merging predictions
+```{r}
+expand_predictions <- function(all_predictions, df, model_name) {
+  pred_df <- all_predictions %>%
+    filter(model == model_name) %>%
+    select(x, predicted_effect) %>%
+    mutate(predicted_effect = abs(predicted_effect))
+  
+  df <- inner_join(df, pred_df, by = "x")
+  colnames(df)[colnames(df) == 'predicted_effect'] <- sprintf('predicted_effect_%s', sub('.1', '', model_name))
+  
+  return(df)
+}
+
+all_predictions <- bind_rows(result_list)
+
+windows_all_predictions <- expand_predictions(all_predictions, windows_df, 'Win8.1')
+windows_all_predictions <- expand_predictions(all_predictions, windows_all_predictions, 'Win7')
+
+windows_all_predictions <- windows_all_predictions %>%
+  mutate(windows_new_users = Win10 - predicted_effect_Win8 - predicted_effect_Win7) %>%
+  mutate(windows_new_users = ifelse(windows_new_users < 0, 0, windows_new_users))
+```
+
+Showing Predictions 
+```{r}
+legend_names <- c("New and other versions users", "Users from Win8.1", "Users from Win7")
+
+df_melted <- windows_all_predictions %>%
+  select(Date, all_of(c("windows_new_users", "predicted_effect_Win8", "predicted_effect_Win7"))) %>%
+  rename(
+    !!legend_names[1] := windows_new_users,
+    !!legend_names[2] := predicted_effect_Win8,
+    !!legend_names[3] := predicted_effect_Win7
+  ) %>%
+  pivot_longer(cols = -Date, names_to = "Windows_Version", values_to = "Value")
+
+plot <- ggplot(df_melted, aes(x = Date, y = Value, fill = Windows_Version)) +
+  geom_col(position = "stack", width = 22) +
+  labs(
+    title = "Estimated Origin of Windows 10 Users in Europe",
+    x = "Date",
+    y = "Number of households",
+    fill = "Windows Version"
+  ) +
+  theme_minimal() +
+  scale_fill_viridis_d(option = "C", begin = 0.1, end = 0.9) +  
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    legend.position = "right"
+  )
+plot(plot)
+```
+
+```{r}
+df_new_users_vs_households_with_windows <- data.frame(
+  rolling_difference_total_windows_households = c(0, diff(windows_all_predictions$households_with_windows)), 
+  new_users_and_other_windows = windows_all_predictions$windows_new_users
+) %>%
+  filter(new_users_and_other_windows > 0)
+
+print(df_new_users_vs_households_with_windows)
+```
